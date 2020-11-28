@@ -84,6 +84,7 @@ static const uint8_t XMU_DESC_CONFIGURATION[] =
 };
 
 bool flash_init();
+bool sdcard_init();
 
 #ifdef __cplusplus
 }

@@ -15,6 +15,11 @@ static int32_t flash_read(uint32_t block, uint32_t offset, void *buf, uint32_t s
 static int32_t flash_program(uint32_t block, uint32_t offset, const void *buf, uint32_t size);
 static int32_t flash_erase(uint32_t block);
 static int32_t flash_wait(uint32_t microseconds);
+#elif defined(__IMXRT1062__) && defined(USE_BUILTIN_SDCARD)
+static uint32_t sdcard_block_count();
+static uint16_t sdcard_block_size();
+static void sdcard_read(uint32_t block, uint32_t offset, void *buf, uint32_t size);
+static void sdcard_write(uint32_t block, uint32_t offset, const void *buf, uint32_t size);
 #else
 #ifndef DMAMEM
 #define DMAMEM
@@ -47,6 +52,8 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
     TU_LOG2("READ10: lba: %i, off: %i, len: %i\r\n", lba, offset, bufsize);
 #if defined(__IMXRT1062__) && defined(USE_EXT_FLASH)
     flash_read(lba, offset, buffer, bufsize);
+#elif defined(__IMXRT1062__) && defined(USE_BUILTIN_SDCARD)
+    sdcard_read(lba, offset, buffer, bufsize);
 #else
     memcpy(buffer, &msc_ram_disk[lba * MSC_BLOCK_SIZE] + offset, bufsize);
 #endif
@@ -61,6 +68,8 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
 #if defined(__IMXRT1062__) && defined(USE_EXT_FLASH)
     flash_erase(lba);
     flash_program(lba, offset, buffer, bufsize);
+#elif defined(__IMXRT1062__) && defined(USE_BUILTIN_SDCARD)
+    sdcard_write(lba, offset, buffer, bufsize);
 #else
     memcpy(&msc_ram_disk[lba * MSC_BLOCK_SIZE] + offset, buffer, bufsize);
 #endif
@@ -72,8 +81,13 @@ void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_siz
 {
     (void)lun;
     TU_LOG2("tud_msc_capacity_cb\r\n");
+#if defined(__IMXRT1062__) && defined(USE_BUILTIN_SDCARD)
+    *block_count = sdcard_block_count();
+    *block_size = sdcard_block_size();
+#else
     *block_count = MSC_BLOCK_NUM;
     *block_size = MSC_BLOCK_SIZE;
+#endif
 }
 
 //OG Xbox never seems to call this SCSI command
@@ -344,6 +358,125 @@ bool flash_init()
 
     return true;
 }
+#elif defined(__IMXRT1062__) && defined(USE_BUILTIN_SDCARD)
+
+#include "diskio_wrapper.h"
+
+static uint32_t sdcard_block_count()
+{
+    return _disk_volume_num_blocks();
+}
+
+static uint16_t sdcard_block_size()
+{
+    return (uint16_t)_disk_volume_get_block_size();
+}
+
+static void sdcard_read(uint32_t block, uint32_t offset, void *buf, uint32_t size)
+{
+    uint32_t pos = 0;
+    uint32_t curr_block = block;
+    uint32_t block_sz = sdcard_block_size();
+    uint8_t block_buf[block_sz];
+
+    if (offset > block_sz)
+    {
+        TU_LOG2("sdcard_read: Offset exceeds block size")
+        return;
+    }
+
+    /*
+     * Read first (partial) block
+     */
+
+    // Calculate size to copy, either to the end of block or partial of that
+    uint32_t copy_size = min((block_sz - offset), size);
+    TU_LOG2("sdcard_read: Reading initial block %04X, offset: %04X, size: %04X",
+            curr_block, offset, copy_size);
+    _read_block(curr_block, block_buf);
+    memcpy(buf, &block_buf[offset], copy_size);
+    pos += copy_size;
+    curr_block++;
+
+    /*
+     * Read rest of data
+     */
+    while (pos < size)
+    {
+        copy_size = min(block_sz, (size - pos));
+        TU_LOG2("sdcard_read: Reading successive block %04X, offset: %04X, size: %04X",
+                curr_block, offset, copy_size);
+        _read_block(curr_block, block_buf);
+        memcpy(&buf[pos], block_buf, copy_size);
+        pos += copy_size;
+        curr_block++;
+    }
+}
+
+static void sdcard_write(uint32_t block, uint32_t offset, const void *buf, uint32_t size)
+{
+    uint32_t pos = 0;
+    uint32_t curr_block = block;
+    uint32_t block_sz = sdcard_block_size();
+    uint8_t block_buf[block_sz];
+
+    if (offset > block_sz)
+    {
+        TU_LOG2("sdcard_write: Offset exceeds block size")
+        return;
+    }
+
+    /*
+     * Read first (partial) block
+     */
+
+    // Calculate size to copy, either to the end of block or partial of that
+    uint32_t copy_size = min((block_sz - offset), size);
+    TU_LOG2("sdcard_write: Reading initial block %04X, offset: %04X, size: %04X",
+            curr_block, offset, copy_size);
+    _read_block(curr_block, block_buf);
+    // Copying (partitial) data to full block data
+    memcpy(&block_buf[offset], buf, copy_size);
+    // Writing full block back to sdcard
+    _write_block(curr_block, block_buf);
+
+    pos += copy_size;
+    curr_block++;
+
+    /*
+     * Read rest of data
+     */
+    while (pos < size)
+    {
+        copy_size = min(block_sz, (size - pos));
+        if (copy_size < block_sz)
+        {
+            // Partitial block write
+            TU_LOG2("sdcard_write: Partial write on block %04X, size: %04X",
+                    curr_block, copy_size);
+            _read_block(curr_block, block_buf);
+            memcpy(&block_buf, &buf[pos], copy_size);
+            _write_block(curr_block, block_buf);
+        }
+        else
+        {
+            // Full block write
+            TU_LOG2("sdcard_write: Full write on block %04X, size: %04X",
+                    curr_block, copy_size);
+            _write_block(curr_block, &buf[pos]);
+        }
+
+        pos += copy_size;
+        curr_block++;
+    }
+}
+
+bool sdcard_init()
+{
+    _disk_init();
+    return true;
+}
+
 #endif
 
 #endif
